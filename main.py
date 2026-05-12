@@ -8,6 +8,7 @@ import gymnasium as gym
 import cv2
 import torch
 import torch.nn as nn
+import wandb
 gym.register_envs(ale_py)
 
 def preprocess_obs(obs0, obs1):
@@ -83,9 +84,24 @@ def main():
     epsilon_end = 0.1
     target_update_interval = 1000
     discount_factor = 0.99
+    replay_buffer_capacity = 1_000_000
 
-    replay_buffer = ReplayBuffer(capacity=1_000_000)
+    replay_buffer = ReplayBuffer(capacity=replay_buffer_capacity)
     replay_start_size = 50_000
+
+    wandb.init(
+        project="dqn-atari", name="breakout",
+        config={
+            "training_steps": training_steps,
+            "epsilon_start": epsilon_start,
+            "epsilon_decay_steps": epsilon_decay_steps,
+            "epsilon_end": epsilon_end,
+            "target_update_interval": target_update_interval,
+            "discount_factor": discount_factor,
+            "replay_start_size": replay_start_size,
+            "replay_buffer_capacity": replay_buffer_capacity
+        }
+    )
 
     env = gym.make("ALE/Breakout-v5")#, render_mode="human")
 
@@ -97,6 +113,7 @@ def main():
     print(f"Observation shape: {obs.shape}")
 
     total_reward = 0
+    episode_count = 0
     loss_history = deque(maxlen=100)
     for step in range(training_steps):
         epsilon = max(epsilon_end, epsilon_start - (epsilon_start - epsilon_end) * (step / epsilon_decay_steps))
@@ -116,7 +133,12 @@ def main():
         # time.sleep(0.05)
 
         if terminated or truncated:
+            episode_count += 1
             print(f"Episode ended, resetting. Total reward: {total_reward}")
+            wandb.log(
+                {"episode_reward": total_reward, "episode_count": episode_count},
+                step=step
+            )
             obs, prev_obs, frame_stack = reset_env(env)
             prev_stacked_obs = np.stack(frame_stack)
             total_reward = 0
@@ -154,10 +176,20 @@ def main():
 
             if step % 100 == 0:
                 print(f"Step {step + 1:3d} | loss={np.mean(loss_history):.4f}")
+                wandb.log(
+                    {
+                        "loss": np.mean(loss_history),
+                        "epsilon": epsilon,
+                        "buffer_size": len(replay_buffer),
+                        "episode_count": episode_count,
+                    },
+                    step=step
+                )
             if step % target_update_interval == 0:
                 target_q_net.load_state_dict(q_net.state_dict())
 
     env.close()
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
