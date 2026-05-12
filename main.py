@@ -70,9 +70,11 @@ def reset_env(env):
 
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     training_steps = 10_000_000
-    q_net = QNetwork(n_actions=4)
-    target_q_net = QNetwork(n_actions=4)
+    q_net = QNetwork(n_actions=4).to(device)
+    target_q_net = QNetwork(n_actions=4).to(device)
     target_q_net.load_state_dict(q_net.state_dict())
     optimizer = torch.optim.RMSprop(q_net.parameters(), lr=0.00025, momentum=0.95, alpha=0.95, eps=0.01)
     criterion = nn.SmoothL1Loss()
@@ -103,9 +105,11 @@ def main():
         elif random.random() < epsilon:
             action = env.action_space.sample()
         else:
-            obs_tensor = torch.tensor(prev_stacked_obs, dtype=torch.float32).unsqueeze(0) / 255.0
-            q_values = q_net(obs_tensor)
-            action = q_values.squeeze(0).argmax().item()
+            with torch.no_grad():
+                obs_tensor = torch.tensor(prev_stacked_obs, dtype=torch.float32).unsqueeze(0) / 255.0
+                obs_tensor = obs_tensor.to(device)
+                q_values = q_net(obs_tensor)
+                action = q_values.squeeze(0).argmax().item()
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         # print(f"Step {step + 1:3d} | action={action} | reward={reward} | shape={obs.shape}")
@@ -128,11 +132,13 @@ def main():
 
         if len(replay_buffer) >= replay_start_size:
             stacked_obs, actions, rewards, next_stacked_obs, dones = replay_buffer.sample(batch_size=32)
-            actions = torch.tensor(actions, dtype=torch.long)
-            rewards = torch.tensor(rewards, dtype=torch.float32)
-            dones = torch.tensor(dones, dtype=torch.float32)
+            actions = torch.tensor(actions, dtype=torch.long).to(device)
+            rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+            dones = torch.tensor(dones, dtype=torch.float32).to(device)
             obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32) / 255.0
+            obs_tensor = obs_tensor.to(device)
             next_obs_tensor = torch.tensor(next_stacked_obs, dtype=torch.float32) / 255.0
+            next_obs_tensor = next_obs_tensor.to(device)
             q_values = q_net(obs_tensor)
             q_values = q_values.gather(1, actions.unsqueeze(1))
             q_values = q_values.squeeze(1)
