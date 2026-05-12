@@ -70,8 +70,7 @@ def reset_env(env):
 
 
 def main():
-    training_steps = 100_000
-    replay_start_size = 1_000
+    training_steps = 10_000_000
     q_net = QNetwork(n_actions=4)
     target_q_net = QNetwork(n_actions=4)
     target_q_net.load_state_dict(q_net.state_dict())
@@ -83,7 +82,8 @@ def main():
     target_update_interval = 1000
     discount_factor = 0.99
 
-    replay_buffer = ReplayBuffer(capacity=10000)
+    replay_buffer = ReplayBuffer(capacity=1_000_000)
+    replay_start_size = 50_000
 
     env = gym.make("ALE/Breakout-v5")#, render_mode="human")
 
