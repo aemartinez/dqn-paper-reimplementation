@@ -1,3 +1,4 @@
+import argparse
 import time
 from collections import deque
 import random
@@ -70,7 +71,7 @@ def reset_env(env):
     return obs, prev_obs, frame_stack
 
 
-def main():
+def main(algorithm):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     training_steps = 10_000_000
@@ -90,7 +91,7 @@ def main():
     replay_start_size = 50_000
 
     wandb.init(
-        project="dqn-atari", name="breakout",
+        project="dqn-atari", name=f"{algorithm}-breakout",
         config={
             "training_steps": training_steps,
             "epsilon_start": epsilon_start,
@@ -99,7 +100,8 @@ def main():
             "target_update_interval": target_update_interval,
             "discount_factor": discount_factor,
             "replay_start_size": replay_start_size,
-            "replay_buffer_capacity": replay_buffer_capacity
+            "replay_buffer_capacity": replay_buffer_capacity,
+            "algorithm": algorithm,
         }
     )
 
@@ -165,9 +167,16 @@ def main():
             q_values = q_values.gather(1, actions.unsqueeze(1))
             q_values = q_values.squeeze(1)
             with torch.no_grad():
-                next_q_values = target_q_net(next_obs_tensor)
-                max_next_q_values = next_q_values.max(dim=1)[0]
-                target_q_values = rewards + (1 - dones) * discount_factor * max_next_q_values
+                if algorithm == "dqn":
+                    next_q = target_q_net(next_obs_tensor)
+                    max_next_q = next_q.max(dim=1)[0]
+                    target_q_values = rewards + (1 - dones) * discount_factor * max_next_q                
+                elif algorithm == "double_dqn":
+                    next_q_online = q_net(next_obs_tensor)                                                                       
+                    best_actions = next_q_online.argmax(dim=1)
+                    next_q_target = target_q_net(next_obs_tensor)                                                                
+                    max_next_q = next_q_target.gather(1, best_actions.unsqueeze(1)).squeeze(1)
+                    target_q_values = rewards + (1 - dones) * discount_factor * max_next_q
             loss = criterion(q_values, target_q_values)
             optimizer.zero_grad()
             loss.backward()
@@ -182,6 +191,7 @@ def main():
                         "epsilon": epsilon,
                         "buffer_size": len(replay_buffer),
                         "episode_count": episode_count,
+                        "mean_target_q": target_q_values.mean().item(),
                     },
                     step=step
                 )
@@ -192,4 +202,7 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn"])
+    args = parser.parse_args()
+    main(args.algorithm)
