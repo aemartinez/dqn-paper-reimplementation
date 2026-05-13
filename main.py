@@ -171,7 +171,7 @@ def main(algorithm):
                     next_q = target_q_net(next_obs_tensor)
                     max_next_q = next_q.max(dim=1)[0]
                     target_q_values = rewards + (1 - dones) * discount_factor * max_next_q                
-                elif algorithm == "double_dqn":
+                elif algorithm == "ddqn":
                     next_q_online = q_net(next_obs_tensor)                                                                       
                     best_actions = next_q_online.argmax(dim=1)
                     next_q_target = target_q_net(next_obs_tensor)                                                                
