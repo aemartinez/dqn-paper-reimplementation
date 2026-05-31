@@ -63,6 +63,29 @@ class QNetwork(nn.Module):
         x = nn.functional.relu(self.fc1(x))
         return self.fc2(x)
 
+class DuelingQNetwork(nn.Module):
+    def __init__(self, n_actions):
+        super().__init__()
+        self.conv1 = nn.Conv2d(4, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.advantage_fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.advantage_fc2 = nn.Linear(512, n_actions)
+        self.value_fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.value_fc2 = nn.Linear(512, 1)
+        
+
+    def forward(self, x):
+        x = nn.functional.relu(self.conv1(x))
+        x = nn.functional.relu(self.conv2(x))
+        x = nn.functional.relu(self.conv3(x))
+        x = x.flatten(start_dim=1)
+        adv = nn.functional.relu(self.advantage_fc1(x))
+        adv = self.advantage_fc2(adv)
+        val = nn.functional.relu(self.value_fc1(x))
+        val = self.value_fc2(val)
+        return val + adv - adv.mean(dim=1, keepdim=True)
+
 def reset_env(env):
     obs, info = env.reset()
     prev_obs = obs
@@ -75,8 +98,14 @@ def main(algorithm):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     training_steps = 10_000_000
-    q_net = QNetwork(n_actions=4).to(device)
-    target_q_net = QNetwork(n_actions=4).to(device)
+    if algorithm == "dqn" or algorithm == "ddqn":
+        q_net = QNetwork(n_actions=4).to(device)
+        target_q_net = QNetwork(n_actions=4).to(device)
+    elif algorithm == "dueling-dqn":
+        q_net = DuelingQNetwork(n_actions=4).to(device)
+        target_q_net = DuelingQNetwork(n_actions=4).to(device)
+    else:
+        raise ValueError(f"Invalid algorithm: {algorithm}")
     target_q_net.load_state_dict(q_net.state_dict())
     optimizer = torch.optim.RMSprop(q_net.parameters(), lr=0.00025, momentum=0.95, alpha=0.95, eps=0.01)
     criterion = nn.SmoothL1Loss()
@@ -171,7 +200,7 @@ def main(algorithm):
                     next_q = target_q_net(next_obs_tensor)
                     max_next_q = next_q.max(dim=1)[0]
                     target_q_values = rewards + (1 - dones) * discount_factor * max_next_q                
-                elif algorithm == "ddqn":
+                elif algorithm == "ddqn" or algorithm == "dueling-dqn":
                     next_q_online = q_net(next_obs_tensor)                                                                       
                     best_actions = next_q_online.argmax(dim=1)
                     next_q_target = target_q_net(next_obs_tensor)                                                                
@@ -203,6 +232,6 @@ def main(algorithm):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn"])
+    parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn", "dueling-dqn"])
     args = parser.parse_args()
     main(args.algorithm)
