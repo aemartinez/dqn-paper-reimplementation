@@ -94,7 +94,7 @@ def reset_env(env):
     return obs, prev_obs, frame_stack
 
 
-def main(algorithm):
+def main(algorithm, n_steps_td):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     training_steps = 10_000_000
@@ -119,6 +119,8 @@ def main(algorithm):
     replay_buffer = ReplayBuffer(capacity=replay_buffer_capacity)
     replay_start_size = 50_000
 
+    n_steps_td_buffer = list()
+
     wandb.init(
         project="dqn-atari", name=f"{algorithm}-breakout",
         config={
@@ -131,6 +133,7 @@ def main(algorithm):
             "replay_start_size": replay_start_size,
             "replay_buffer_capacity": replay_buffer_capacity,
             "algorithm": algorithm,
+            "n_steps_td": n_steps_td,
         }
     )
 
@@ -160,11 +163,23 @@ def main(algorithm):
                 action = q_values.squeeze(0).argmax().item()
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
-        # print(f"Step {step + 1:3d} | action={action} | reward={reward} | shape={obs.shape}")
-        # time.sleep(0.05)
+
+        processed_obs = preprocess_obs(obs, prev_obs)
+        frame_stack.append(processed_obs)
+        stacked_obs = np.stack(frame_stack)
+        reward = np.clip(reward, -1, 1)
+        n_steps_td_buffer.append((prev_stacked_obs, action, reward, stacked_obs, terminated or truncated))
 
         if terminated or truncated:
             episode_count += 1
+
+            truncated_return = 0
+            _, _, _, target_stacked_obs, _ = n_steps_td_buffer[-1]
+            for i in range(len(n_steps_td_buffer)):
+                stacked_obs, action, reward, _, _ = n_steps_td_buffer[-i-1]
+                truncated_return = reward + discount_factor * truncated_return
+                replay_buffer.push(stacked_obs, action, truncated_return, target_stacked_obs, done=True)
+
             print(f"Episode ended, resetting. Total reward: {total_reward}")
             wandb.log(
                 {"episode_reward": total_reward, "episode_count": episode_count},
@@ -173,39 +188,45 @@ def main(algorithm):
             obs, prev_obs, frame_stack = reset_env(env)
             prev_stacked_obs = np.stack(frame_stack)
             total_reward = 0
+            n_steps_td_buffer.clear()
             continue
 
-        processed_obs = preprocess_obs(obs, prev_obs)
-        frame_stack.append(processed_obs)
-        stacked_obs = np.stack(frame_stack)
-        reward = np.clip(reward, -1, 1)
-        replay_buffer.push(prev_stacked_obs, action, reward, stacked_obs, terminated or truncated)
+        if len(n_steps_td_buffer) >= n_steps_td:
+            stacked_obs, action, reward, next_stacked_obs, done = n_steps_td_buffer.pop(0)
+            truncated_return = reward
+            for i in range(n_steps_td - 1):
+                _, _, rwd, _, _ = n_steps_td_buffer[i]
+                truncated_return += rwd * (discount_factor ** (i + 1))
+            
+            _, _, _, n_steps_next_stacked_obs, _ = n_steps_td_buffer[n_steps_td - 2]
+            replay_buffer.push(stacked_obs, action, truncated_return, n_steps_next_stacked_obs, done)
+
         prev_obs = obs
         prev_stacked_obs = stacked_obs
 
         if len(replay_buffer) >= replay_start_size:
-            stacked_obs, actions, rewards, next_stacked_obs, dones = replay_buffer.sample(batch_size=32)
+            stacked_obs, actions, truncated_returns, n_steps_next_stacked_obs, dones = replay_buffer.sample(batch_size=32)
             actions = torch.tensor(actions, dtype=torch.long).to(device)
-            rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+            truncated_returns = torch.tensor(truncated_returns, dtype=torch.float32).to(device)
             dones = torch.tensor(dones, dtype=torch.float32).to(device)
             obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32) / 255.0
             obs_tensor = obs_tensor.to(device)
-            next_obs_tensor = torch.tensor(next_stacked_obs, dtype=torch.float32) / 255.0
-            next_obs_tensor = next_obs_tensor.to(device)
+            n_steps_next_obs_tensor = torch.tensor(n_steps_next_stacked_obs, dtype=torch.float32) / 255.0
+            n_steps_next_obs_tensor = n_steps_next_obs_tensor.to(device)
             q_values = q_net(obs_tensor)
             q_values = q_values.gather(1, actions.unsqueeze(1))
             q_values = q_values.squeeze(1)
             with torch.no_grad():
                 if algorithm == "dqn":
-                    next_q = target_q_net(next_obs_tensor)
+                    next_q = target_q_net(n_steps_next_obs_tensor)
                     max_next_q = next_q.max(dim=1)[0]
-                    target_q_values = rewards + (1 - dones) * discount_factor * max_next_q                
+                    target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q                
                 elif algorithm == "ddqn" or algorithm == "dueling-dqn":
-                    next_q_online = q_net(next_obs_tensor)                                                                       
+                    next_q_online = q_net(n_steps_next_obs_tensor)                                                                       
                     best_actions = next_q_online.argmax(dim=1)
-                    next_q_target = target_q_net(next_obs_tensor)                                                                
+                    next_q_target = target_q_net(n_steps_next_obs_tensor)                                                                
                     max_next_q = next_q_target.gather(1, best_actions.unsqueeze(1)).squeeze(1)
-                    target_q_values = rewards + (1 - dones) * discount_factor * max_next_q
+                    target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q
             loss = criterion(q_values, target_q_values)
             optimizer.zero_grad()
             loss.backward()
@@ -233,5 +254,6 @@ def main(algorithm):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn", "dueling-dqn"])
+    parser.add_argument("--n-steps-td", type=int, default=1)
     args = parser.parse_args()
-    main(args.algorithm)
+    main(args.algorithm, args.n_steps_td)
