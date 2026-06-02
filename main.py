@@ -86,10 +86,13 @@ class DuelingQNetwork(nn.Module):
         val = self.value_fc2(val)
         return val + adv - adv.mean(dim=1, keepdim=True)
 
-def reset_env(env):
+def reset_env(env, max_no_op_steps):
+    no_op_steps = random.randint(1, max_no_op_steps)
     obs, info = env.reset()
-    prev_obs = obs
-    processed = preprocess_obs(obs, obs)
+    for _ in range(no_op_steps):
+        prev_obs = obs
+        obs, _, _, _, _ = env.step(0)
+    processed = preprocess_obs(prev_obs, obs)
     frame_stack = deque([processed] * 4, maxlen=4)
     return obs, prev_obs, frame_stack
 
@@ -107,14 +110,26 @@ def main(algorithm, n_steps_td):
     else:
         raise ValueError(f"Invalid algorithm: {algorithm}")
     target_q_net.load_state_dict(q_net.state_dict())
-    optimizer = torch.optim.RMSprop(q_net.parameters(), lr=0.00025, momentum=0.95, alpha=0.95, eps=0.01)
+    gradient_momentum = 0.95
+    squared_gradient_momentum = 0.95
+    min_squared_gradient = 0.01
+    optimizer = torch.optim.RMSprop(
+        q_net.parameters(),
+        lr=0.00025,
+        momentum=gradient_momentum,
+        alpha=squared_gradient_momentum,
+        eps=min_squared_gradient
+    )
     criterion = nn.SmoothL1Loss()
     epsilon_start = 1.0
-    epsilon_decay_steps = 100_000
+    epsilon_decay_steps = 1_000_000
     epsilon_end = 0.1
-    target_update_interval = 1000
+    target_net_update_freq = 10_000
     discount_factor = 0.99
     replay_buffer_capacity = 1_000_000
+    mini_batch_size = 32
+    update_freq = 4
+    no_op_max_steps = 30
 
     replay_buffer = ReplayBuffer(capacity=replay_buffer_capacity)
     replay_start_size = 50_000
@@ -128,12 +143,15 @@ def main(algorithm, n_steps_td):
             "epsilon_start": epsilon_start,
             "epsilon_decay_steps": epsilon_decay_steps,
             "epsilon_end": epsilon_end,
-            "target_update_interval": target_update_interval,
+            "target_net_update_freq": target_net_update_freq,
             "discount_factor": discount_factor,
             "replay_start_size": replay_start_size,
             "replay_buffer_capacity": replay_buffer_capacity,
             "algorithm": algorithm,
             "n_steps_td": n_steps_td,
+            "mini_batch_size": mini_batch_size,
+            "update_freq": update_freq,
+            "no_op_max_steps": no_op_max_steps,
         }
     )
 
@@ -142,7 +160,7 @@ def main(algorithm, n_steps_td):
     print(f"Observation space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
 
-    obs, prev_obs, frame_stack = reset_env(env)
+    obs, prev_obs, frame_stack = reset_env(env, no_op_max_steps)
     prev_stacked_obs = np.stack(frame_stack)
     print(f"Observation shape: {obs.shape}")
 
@@ -185,7 +203,7 @@ def main(algorithm, n_steps_td):
                 {"episode_reward": total_reward, "episode_count": episode_count},
                 step=step
             )
-            obs, prev_obs, frame_stack = reset_env(env)
+            obs, prev_obs, frame_stack = reset_env(env, no_op_max_steps)
             prev_stacked_obs = np.stack(frame_stack)
             total_reward = 0
             n_steps_td_buffer.clear()
@@ -198,54 +216,58 @@ def main(algorithm, n_steps_td):
                 _, _, rwd, _, _ = n_steps_td_buffer[i]
                 truncated_return += rwd * (discount_factor ** (i + 1))
             
-            _, _, _, n_steps_next_stacked_obs, _ = n_steps_td_buffer[n_steps_td - 2]
+            if n_steps_td == 1:
+                n_steps_next_stacked_obs = next_stacked_obs
+            else:
+                _, _, _, n_steps_next_stacked_obs, _ = n_steps_td_buffer[n_steps_td - 2]
             replay_buffer.push(stacked_obs, action, truncated_return, n_steps_next_stacked_obs, done)
 
         prev_obs = obs
         prev_stacked_obs = stacked_obs
 
         if len(replay_buffer) >= replay_start_size:
-            stacked_obs, actions, truncated_returns, n_steps_next_stacked_obs, dones = replay_buffer.sample(batch_size=32)
-            actions = torch.tensor(actions, dtype=torch.long).to(device)
-            truncated_returns = torch.tensor(truncated_returns, dtype=torch.float32).to(device)
-            dones = torch.tensor(dones, dtype=torch.float32).to(device)
-            obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32) / 255.0
-            obs_tensor = obs_tensor.to(device)
-            n_steps_next_obs_tensor = torch.tensor(n_steps_next_stacked_obs, dtype=torch.float32) / 255.0
-            n_steps_next_obs_tensor = n_steps_next_obs_tensor.to(device)
-            q_values = q_net(obs_tensor)
-            q_values = q_values.gather(1, actions.unsqueeze(1))
-            q_values = q_values.squeeze(1)
-            with torch.no_grad():
-                if algorithm == "dqn":
-                    next_q = target_q_net(n_steps_next_obs_tensor)
-                    max_next_q = next_q.max(dim=1)[0]
-                    target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q                
-                elif algorithm == "ddqn" or algorithm == "dueling-dqn":
-                    next_q_online = q_net(n_steps_next_obs_tensor)                                                                       
-                    best_actions = next_q_online.argmax(dim=1)
-                    next_q_target = target_q_net(n_steps_next_obs_tensor)                                                                
-                    max_next_q = next_q_target.gather(1, best_actions.unsqueeze(1)).squeeze(1)
-                    target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q
-            loss = criterion(q_values, target_q_values)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            loss_history.append(loss.item())
+            if step % update_freq == 0:
+                stacked_obs, actions, truncated_returns, n_steps_next_stacked_obs, dones = replay_buffer.sample(batch_size=mini_batch_size)
+                actions = torch.tensor(actions, dtype=torch.long).to(device)
+                truncated_returns = torch.tensor(truncated_returns, dtype=torch.float32).to(device)
+                dones = torch.tensor(dones, dtype=torch.float32).to(device)
+                obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32) / 255.0
+                obs_tensor = obs_tensor.to(device)
+                n_steps_next_obs_tensor = torch.tensor(n_steps_next_stacked_obs, dtype=torch.float32) / 255.0
+                n_steps_next_obs_tensor = n_steps_next_obs_tensor.to(device)
+                q_values = q_net(obs_tensor)
+                q_values = q_values.gather(1, actions.unsqueeze(1))
+                q_values = q_values.squeeze(1)
+                with torch.no_grad():
+                    if algorithm == "dqn":
+                        next_q = target_q_net(n_steps_next_obs_tensor)
+                        max_next_q = next_q.max(dim=1)[0]
+                        target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q                
+                    elif algorithm == "ddqn" or algorithm == "dueling-dqn":
+                        next_q_online = q_net(n_steps_next_obs_tensor)                                                                       
+                        best_actions = next_q_online.argmax(dim=1)
+                        next_q_target = target_q_net(n_steps_next_obs_tensor)                                                                
+                        max_next_q = next_q_target.gather(1, best_actions.unsqueeze(1)).squeeze(1)
+                        target_q_values = truncated_returns + (1 - dones) * (discount_factor ** n_steps_td) * max_next_q
+                loss = criterion(q_values, target_q_values)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_history.append(loss.item())
 
-            if step % 100 == 0:
-                print(f"Step {step + 1:3d} | loss={np.mean(loss_history):.4f}")
-                wandb.log(
-                    {
-                        "loss": np.mean(loss_history),
-                        "epsilon": epsilon,
-                        "buffer_size": len(replay_buffer),
-                        "episode_count": episode_count,
-                        "mean_target_q": target_q_values.mean().item(),
-                    },
-                    step=step
-                )
-            if step % target_update_interval == 0:
+                if step % 100 == 0:
+                    print(f"Step {step + 1:3d} | loss={np.mean(loss_history):.4f}")
+                    wandb.log(
+                        {
+                            "loss": np.mean(loss_history),
+                            "epsilon": epsilon,
+                            "buffer_size": len(replay_buffer),
+                            "episode_count": episode_count,
+                            "mean_target_q": target_q_values.mean().item(),
+                        },
+                        step=step
+                    )
+            if step % target_net_update_freq == 0:
                 target_q_net.load_state_dict(q_net.state_dict())
 
     env.close()
