@@ -251,6 +251,9 @@ def main(algorithm, n_steps_td):
             n_steps_td_buffer.clear()
             continue
 
+        prev_obs = obs
+        prev_stacked_obs = stacked_obs
+        
         if len(n_steps_td_buffer) >= n_steps_td:
             stacked_obs, action, reward, next_stacked_obs, done = n_steps_td_buffer.pop(0)
             truncated_return = reward
@@ -263,9 +266,6 @@ def main(algorithm, n_steps_td):
             else:
                 _, _, _, n_steps_next_stacked_obs, _ = n_steps_td_buffer[n_steps_td - 2]
             replay_buffer.push(stacked_obs, action, truncated_return, n_steps_next_stacked_obs, done)
-
-        prev_obs = obs
-        prev_stacked_obs = stacked_obs
 
         if len(replay_buffer) >= config["replay_start_size"]:
             if step % config["update_freq"] == 0:
