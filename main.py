@@ -144,16 +144,12 @@ def load_checkpoint(
     replay_buffer.load_state_dict(checkpoint["replay_buffer_state_dict"])
     return step, q_net, target_q_net, optimizer, replay_buffer
 
-def main(algorithm, n_steps_td):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    os.makedirs("checkpoints", exist_ok=True)
-
-    config = {
+def get_config(algorithm, n_steps_td=1):
+    return {
         "algorithm": algorithm,
         "discount_factor": 0.99,
         "epsilon_start": 1.0,
-        "epsilon_decay_steps": 1_000_000,
+        "epsilon_decay_steps": 250_000,
         "epsilon_end": 0.1,
         "gradient_momentum": 0.95,
         "learning_rate": 0.00025,
@@ -161,14 +157,22 @@ def main(algorithm, n_steps_td):
         "mini_batch_size": 32,
         "n_steps_td": n_steps_td,
         "no_op_max_steps": 30,
-        "replay_start_size": 50_000,
+        "replay_start_size": 12_500,
         "replay_buffer_capacity": 1_000_000,
+        "repeat_action_probability": 0.25,
         "squared_gradient_momentum": 0.95,
         "target_net_update_freq": 10_000,
-        "training_steps": 10_000_000,
+        "training_steps": 12_500_000,
         "update_freq": 4,
         "checkpoint_freq": 1_000_000,
     }
+
+def train(algorithm, n_steps_td):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs("checkpoints", exist_ok=True)
+
+    config = get_config(algorithm, n_steps_td)
 
     if algorithm == "dqn" or algorithm == "ddqn":
         q_net = QNetwork(n_actions=4).to(device)
@@ -197,7 +201,7 @@ def main(algorithm, n_steps_td):
         config=config
     )
 
-    env = gym.make("ALE/Breakout-v5")#, render_mode="human")
+    env = gym.make("ALE/Breakout-v5", repeat_action_probability=config["repeat_action_probability"])
 
     print(f"Observation space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
@@ -321,12 +325,74 @@ def main(algorithm, n_steps_td):
             if os.path.exists(prev_path):
                 os.remove(prev_path)
                 print(f"Checkpoint removed from {prev_path}")
+
+    print("Evaluating...")
+    total_rewards = evaluate(target_q_net, config)
+    print(f"Total rewards: {total_rewards}")
+    print(f"Mean total reward: {np.mean(total_rewards)}")
     env.close()
     wandb.finish()
 
+def evaluate(target_q_net, config):
+
+    epsilon = 0.05
+    env = gym.make("ALE/Breakout-v5", repeat_action_probability=config["repeat_action_probability"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    obs, prev_obs, frame_stack = reset_env(env, config["no_op_max_steps"])
+    prev_stacked_obs = np.stack(frame_stack)
+
+    total_rewards = []
+    current_total_reward = 0
+    while len(total_rewards) < 30:
+        if random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                obs_tensor = torch.tensor(prev_stacked_obs, dtype=torch.float32).unsqueeze(0) / 255.0
+                obs_tensor = obs_tensor.to(device)
+                q_values = target_q_net(obs_tensor)
+                action = q_values.squeeze(0).argmax().item()
+        obs, reward, terminated, truncated, info = env.step(action)
+        current_total_reward += reward
+
+        processed_obs = preprocess_obs(obs, prev_obs)
+        frame_stack.append(processed_obs)
+        stacked_obs = np.stack(frame_stack)
+
+        if terminated or truncated:
+            total_rewards.append(current_total_reward)
+            current_total_reward = 0
+            obs, prev_obs, frame_stack = reset_env(env, config["no_op_max_steps"])
+            prev_stacked_obs = np.stack(frame_stack)
+            continue
+
+        prev_obs = obs
+        prev_stacked_obs = stacked_obs
+
+    return total_rewards
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn", "dueling-dqn"])
-    parser.add_argument("--n-steps-td", type=int, default=1)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    train_parser = subparsers.add_parser("train")
+    train_parser.add_argument("--algorithm", type=str, default="ddqn", choices=["dqn", "ddqn", "dueling-dqn"])
+    train_parser.add_argument("--n-steps-td", type=int, default=1)
+
+    evaluate_parser = subparsers.add_parser("evaluate")
+    evaluate_parser.add_argument("checkpoint", type=str)
+
     args = parser.parse_args()
-    main(args.algorithm, args.n_steps_td)
+    if args.command == "train":
+        train(args.algorithm, args.n_steps_td)
+    elif args.command == "evaluate":
+        algorithm = os.path.basename(args.checkpoint).split("-breakout-")[0]
+        if algorithm not in ("dqn", "ddqn", "dueling-dqn"):
+            raise ValueError(f"Could not parse algorithm from checkpoint path: {args.checkpoint}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        config = get_config(algorithm)
+        _, _, target_q_net, _, _ = load_checkpoint(args.checkpoint, device, config)
+        total_rewards = evaluate(target_q_net, config)
+        print(f"Total rewards: {total_rewards}")
+        print(f"Mean total reward: {np.mean(total_rewards)}")
